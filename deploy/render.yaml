@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: story1-llm-project-api
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: API_KEY
+        sync: false
+      - key: ALLOWED_API_KEYS
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false

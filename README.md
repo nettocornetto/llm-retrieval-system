@@ -1,0 +1,418 @@
+# Story 1: LLM Retrieval Project
+
+Production-ready FastAPI service for document ingestion, chunking, embedding, vector storage, hybrid retrieval, reranking, grounded answer generation, and offline evaluation over a BEIR subset such as `SciFact` or `FiQA`.
+
+## What this builds
+
+- document ingestion
+- chunking into ~200–400 token windows
+- dense embedding generation
+- FAISS vector index persistence
+- BM25 sparse baseline
+- hybrid retrieval with reciprocal rank fusion
+- optional cross-encoder reranking
+- optional grounded LLM answers
+- `/search` and `/ask` APIs
+- evaluation for `Recall@k`, `MRR`, `nDCG@10`, and latency
+
+## System architecture
+
+```mermaid
+flowchart LR
+    A[BEIR subset\nSciFact / FiQA] --> B[scripts/ingest.py]
+    B --> C[Chunker\n200-400 tokens]
+    C --> D[Embedding model\nSentence Transformers]
+    C --> E[BM25 corpus]
+    D --> F[FAISS index]
+    C --> G[Chunk metadata\nJSONL + SQLite]
+    E --> H[BM25 retriever]
+    F --> I[Dense retriever]
+    H --> J[Hybrid retriever\nRRF fusion]
+    I --> J
+    J --> K[Reranker\nCrossEncoder]
+    K --> L[/search API]
+    K --> M[/ask API]
+    M --> N[Grounded LLM answerer\noptional]
+```
+
+## Why BEIR and why start with SciFact
+
+`BEIR` is a standard benchmark suite for information retrieval evaluation across heterogeneous tasks. `SciFact` is a strong first subset because it is compact enough to iterate quickly while still giving you labeled queries and relevance judgments for retrieval metrics.
+
+## MVP implementation order
+
+1. BM25 retrieval baseline
+2. Dense retrieval
+3. Reranking
+4. LLM answer generation
+5. Evaluation script
+
+The codebase follows that order. Retrieval quality comes first, not the generator.
+
+## Repo structure
+
+```text
+.
+├── app/
+│   ├── api/routes/
+│   │   ├── ask.py
+│   │   ├── health.py
+│   │   └── search.py
+│   ├── core/
+│   │   ├── auth.py
+│   │   ├── config.py
+│   │   └── logging.py
+│   ├── db/
+│   │   ├── models.py
+│   │   └── session.py
+│   ├── jobs/
+│   │   ├── queue.py
+│   │   └── tasks.py
+│   ├── models/schemas.py
+│   ├── retrieval/
+│   │   ├── bm25.py
+│   │   ├── dense.py
+│   │   ├── hybrid.py
+│   │   ├── reranker.py
+│   │   ├── storage.py
+│   │   └── types.py
+│   ├── services/
+│   │   ├── generation.py
+│   │   └── search_service.py
+│   └── main.py
+├── data/
+├── deploy/render.yaml
+├── scripts/
+│   ├── evaluate.py
+│   └── ingest.py
+├── tests/
+├── .env.example
+├── docker-compose.yml
+├── Dockerfile
+├── Makefile
+└── pyproject.toml
+```
+
+## Production stack selection
+
+### API and app runtime
+- **FastAPI** for typed APIs and OpenAPI docs
+- **Uvicorn** as the ASGI server
+- **Pydantic v2** for request/response validation
+
+### Retrieval stack
+- **BM25** via `rank-bm25`
+- **Dense embeddings** via `sentence-transformers`
+- **Vector store** via **FAISS** persisted to disk
+- **Reranker** via `CrossEncoder`
+
+### Metadata store
+- **SQLite** for local/dev persistence of chunk metadata
+- structured so you can swap to **Postgres** in production without changing API contracts
+
+### Jobs and queues
+- **Redis + RQ** included for asynchronous ingestion jobs
+- MVP still supports direct CLI ingestion for fast iteration
+
+### Observability
+- structured JSON logs via `structlog`
+- Prometheus-compatible `/metrics`
+- request IDs attached on every response
+
+## Database schema
+
+Current persisted metadata schema in SQLite:
+
+| column | type | purpose |
+|---|---|---|
+| `id` | integer PK | row id |
+| `doc_id` | string | original dataset doc id |
+| `chunk_id` | string unique | chunk identifier |
+| `source` | string | dataset/source id |
+| `title` | string nullable | document title |
+| `text` | text | chunk text |
+| `start_token` | integer | start offset in tokenized doc |
+| `end_token` | integer | end offset in tokenized doc |
+| `embedding_model` | string | model used for embeddings |
+| `norm` | float | embedding norm |
+
+## API design
+
+### `GET /search`
+
+Query params:
+- `q`: search query
+- `top_k`: number of passages to return
+- `use_reranker`: whether to rerank final candidates
+- `strategy`: `bm25`, `dense`, or `hybrid`
+
+Response:
+
+```json
+{
+  "query": "what evidence links vitamin d to immunity?",
+  "top_k": 5,
+  "latency_ms": 42.7,
+  "hits": [
+    {
+      "rank": 1,
+      "chunk_id": "123::chunk-0",
+      "doc_id": "123",
+      "source": "beir/scifact",
+      "title": "Example title",
+      "text": "Retrieved passage text...",
+      "score": 0.92,
+      "retrieval_score": 0.41,
+      "rerank_score": 0.92,
+      "strategy": "hybrid"
+    }
+  ]
+}
+```
+
+### `GET /ask`
+
+Pipeline:
+1. retrieve top chunks
+2. optionally rerank
+3. prompt the LLM with strict grounded context
+4. return answer plus citations
+
+Response:
+
+```json
+{
+  "query": "Does the evidence support the claim?",
+  "answer": "The evidence partially supports the claim [doc1::chunk-0].",
+  "citations": [
+    {
+      "chunk_id": "doc1::chunk-0",
+      "doc_id": "doc1",
+      "source": "beir/scifact",
+      "quote": "A short excerpt from the retrieved evidence..."
+    }
+  ],
+  "used_llm": true,
+  "retrieval_strategy": "hybrid",
+  "latency_ms": 88.1
+}
+```
+
+## Auth model
+
+All business endpoints are protected with `X-API-Key`.
+
+- local dev: set `ALLOWED_API_KEYS` in `.env`
+- production: inject secrets from the platform
+- current model is intentionally simple for demo/interview use
+- recommended next step: migrate to JWT or gateway-based auth for multi-tenant use
+
+## Background jobs / queues
+
+The repository includes Redis + RQ for async ingestion.
+
+Current pattern:
+- CLI ingestion: `python scripts/ingest.py --dataset beir/scifact`
+- worker-enabled future path: enqueue `app.jobs.tasks.run_ingest`
+
+This keeps the MVP simple while leaving a production-friendly migration path for large corpora.
+
+## Environment variable contract
+
+Copy `.env.example` to `.env` and set these values:
+
+| variable | required | description |
+|---|---:|---|
+| `API_KEY` | yes | convenience single key |
+| `ALLOWED_API_KEYS` | yes | comma-separated API keys |
+| `DATASET_NAME` | yes | e.g. `beir/scifact` |
+| `FAISS_INDEX_PATH` | yes | on-disk FAISS index location |
+| `BM25_INDEX_PATH` | yes | serialized BM25 payload |
+| `METADATA_PATH` | yes | chunk metadata JSONL |
+| `SQLITE_DB_PATH` | yes | local metadata DB |
+| `EMBEDDING_MODEL` | yes | sentence-transformer model |
+| `RERANKER_MODEL` | yes | cross-encoder model |
+| `USE_LLM` | no | enable grounded generation |
+| `OPENAI_API_KEY` | no | for `/ask` generation |
+| `OPENAI_MODEL` | no | default `gpt-4.1-mini` |
+| `REDIS_URL` | no | queue backend |
+| `RQ_QUEUE_NAME` | no | ingest queue name |
+
+## Local run
+
+### 1. Install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .[dev]
+cp .env.example .env
+```
+
+### 2. Ingest SciFact
+
+```bash
+python scripts/ingest.py --dataset beir/scifact
+```
+
+### 3. Run the API
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 4. Query the service
+
+```bash
+curl -H "X-API-Key: change-me" "http://localhost:8000/search?q=gene+expression&top_k=5&strategy=hybrid"
+curl -H "X-API-Key: change-me" "http://localhost:8000/ask?q=Does+the+paper+support+the+claim%3F&top_k=5"
+```
+
+## Docker setup
+
+### Build and run API
+
+```bash
+docker build -t story1-llm-project .
+docker run --rm -p 8000:8000 --env-file .env -v $(pwd)/data:/app/data story1-llm-project
+```
+
+### Full compose stack
+
+```bash
+docker compose up --build
+```
+
+Services:
+- `api`
+- `worker`
+- `redis`
+
+## CI/CD
+
+Included GitHub Actions pipeline:
+- install dependencies
+- run `ruff`
+- run `pytest`
+
+Suggested production promotion flow:
+1. branch protection on `main`
+2. CI required checks
+3. build Docker image on merge
+4. deploy image to Render, Fly.io, Railway, ECS, or Kubernetes
+
+## Deploy instructions
+
+### Render
+
+`deploy/render.yaml` is included.
+
+Typical deploy flow:
+1. push repo to GitHub
+2. connect repo to Render
+3. choose Docker deploy
+4. set secrets: `ALLOWED_API_KEYS`, `OPENAI_API_KEY`
+5. mount persistent disk for `/app/data` if you want local FAISS persistence
+
+### Production recommendation
+
+For real traffic, replace local disk persistence with:
+- object storage for artifacts
+- managed Postgres for metadata
+- a managed vector DB or replicated FAISS build process
+
+## Evaluation
+
+Run:
+
+```bash
+python scripts/evaluate.py --dataset beir/scifact --strategy bm25 --k 10
+python scripts/evaluate.py --dataset beir/scifact --strategy dense --k 10
+python scripts/evaluate.py --dataset beir/scifact --strategy hybrid --k 10
+```
+
+Metrics reported:
+- `Recall@k`
+- `MRR`
+- `nDCG@10`
+- average latency per query
+
+### Metrics table template
+
+Fill after running locally:
+
+| strategy | Recall@10 | MRR | nDCG@10 | avg latency ms |
+|---|---:|---:|---:|---:|
+| BM25 | - | - | - | - |
+| Dense | - | - | - | - |
+| Hybrid | - | - | - | - |
+| Hybrid + Rerank | - | - | - | - |
+
+## Interview-ready positioning
+
+### Architecture
+> Documents are chunked, embedded, stored in a vector index, then a hybrid retriever fetches candidates, a reranker improves precision, and an LLM generates a grounded answer from retrieved evidence.
+
+### Dataset
+> I used a BEIR subset because it is a standard retrieval benchmark with labeled queries and relevance judgments.
+
+### Evaluation
+> I compared BM25, dense retrieval, and hybrid retrieval using Recall@10, MRR, and nDCG@10, plus end-to-end latency.
+
+### Tradeoffs
+> BM25 is cheap and robust, dense retrieval improves semantic matching, reranking improves quality but adds latency, and LLM answer generation is best only after retrieval is reliable.
+
+## Security basics
+
+Implemented now:
+- API key auth on `/search` and `/ask`
+- request IDs for traceability
+- environment-based secret injection
+- no raw user prompt logging by default
+
+Recommended next steps:
+- rate limiting
+- auth rotation
+- secret manager integration
+- dependency vulnerability scanning
+- content filtering and abuse monitoring
+
+## Observability basics
+
+Implemented now:
+- structured JSON logs
+- `/healthz`
+- `/metrics`
+- per-request latency instrumentation
+
+Recommended next steps:
+- OpenTelemetry tracing
+- centralized log shipping
+- SLO dashboards
+- alerting on 5xx rate and latency
+
+## Limitations
+
+- FAISS is persisted locally in this scaffold; that is fine for MVP and single-instance deploys, but not ideal for horizontally scaled multi-replica production.
+- BM25 is serialized from an in-memory tokenized corpus; for large corpora you should move to OpenSearch or Elasticsearch.
+- LLM generation is optional and deliberately gated behind retrieval quality.
+- Evaluation script is designed for fast benchmarking, not large-scale distributed experiments.
+
+## Next steps
+
+- add OpenSearch for industrial sparse retrieval
+- switch metadata storage from SQLite to Postgres
+- add async ingestion endpoint that enqueues jobs to Redis
+- add caching for popular queries
+- add tenant-aware auth and per-tenant indexes
+- add hallucination checks over answer citations
+
+## Quickstart checklist
+
+- [ ] copy `.env.example` to `.env`
+- [ ] run `python scripts/ingest.py --dataset beir/scifact`
+- [ ] run `uvicorn app.main:app --reload`
+- [ ] test `/search`
+- [ ] test `/ask`
+- [ ] run `python scripts/evaluate.py --strategy hybrid`
+- [ ] push to GitHub
