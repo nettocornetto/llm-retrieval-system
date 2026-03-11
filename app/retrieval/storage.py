@@ -2,6 +2,7 @@ import json
 import pickle
 from pathlib import Path
 from typing import Iterable
+from dataclasses import asdict
 
 import faiss
 import numpy as np
@@ -16,7 +17,7 @@ class MetadataStore:
     def save(self, chunks: Iterable[Chunk]) -> None:
         with self.path.open("w", encoding="utf-8") as f:
             for chunk in chunks:
-                f.write(json.dumps(chunk.__dict__, ensure_ascii=False) + "\n")
+                f.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")       
 
     def load(self) -> list[Chunk]:
         with self.path.open("r", encoding="utf-8") as f:
